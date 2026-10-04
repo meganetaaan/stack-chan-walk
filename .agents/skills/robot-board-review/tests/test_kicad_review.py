@@ -77,6 +77,24 @@ class ReviewTests(unittest.TestCase):
     def summaries(self):
         return [json.loads(p.read_text()) for p in self.out.glob("*/summary.json")]
 
+    def assert_preflight_failure_reports(self, expected_inputs):
+        summaries = self.summaries()
+        self.assertEqual(len(summaries), 1)
+        summary = summaries[0]
+        self.assertEqual(summary["exit_code"], 2)
+        self.assertIn("preflight_error", summary)
+        self.assertEqual([c["input"] for c in summary["checks"]], expected_inputs)
+        for check in summary["checks"]:
+            self.assertEqual(check["status"], "NOT_CHECKED")
+            self.assertIsNone(check["command"])
+            self.assertIn(summary["preflight_error"], check["error"])
+            log = Path(check["log"]).read_text(encoding="utf-8")
+            self.assertIn("NOT_CHECKED", log)
+            self.assertIn(check["input"], log)
+            self.assertIn(summary["preflight_error"], log)
+        self.assertTrue(next(self.out.glob("*/preflight.log")).is_file())
+        self.assertEqual(self.calls, [])
+
     def test_no_inputs_is_not_success(self):
         with self.assertRaises(SystemExit) as exc:
             self.invoke()
@@ -84,11 +102,24 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_missing_input_is_not_success(self):
-        self.assertEqual(self.invoke("--pcb", str(self.root / "missing.kicad_pcb")), 2)
-        self.assertEqual(self.calls, [])
+        missing = self.root / "missing.kicad_pcb"
+        self.assertEqual(self.invoke("--pcb", str(missing)), 2)
+        self.assert_preflight_failure_reports([str(missing)])
 
     def test_wrong_extension_is_not_success(self):
         self.assertEqual(self.invoke("--pcb", str(self.sch)), 2)
+        self.assert_preflight_failure_reports([str(self.sch)])
+
+    def test_directory_input_is_not_success(self):
+        directory = self.root / "directory.kicad_pcb"
+        directory.mkdir()
+        self.assertEqual(self.invoke("--pcb", str(directory)), 2)
+        self.assert_preflight_failure_reports([str(directory)])
+
+    def test_missing_input_leaves_all_requested_checks_not_checked(self):
+        missing = self.root / "missing.kicad_pcb"
+        self.assertEqual(self.invoke("--schematic", str(self.sch), "--pcb", str(missing)), 2)
+        self.assert_preflight_failure_reports([str(self.sch), str(missing)])
 
     def test_missing_cli_is_not_success(self):
         with patch.object(review.shutil, "which", return_value=None), redirect_stderr(io.StringIO()):

@@ -200,9 +200,7 @@ def review(args: argparse.Namespace) -> int:
     inputs: list[tuple[str, Path]] = []
     for kind, paths in (("sch", args.schematic), ("pcb", args.pcb)):
         for path in paths:
-            source = Path(path).resolve(strict=True)
-            if not source.is_file() or source.suffix != SUFFIXES[kind]:
-                raise ValueError(f"Expected an existing {SUFFIXES[kind]} file: {path}")
+            source = Path(path).resolve()
             if (kind, source) not in inputs:
                 inputs.append((kind, source))
 
@@ -219,9 +217,12 @@ def review(args: argparse.Namespace) -> int:
     ]
     version_text: str | None = None
 
-    # Keep all input/argument validation above output creation, but persist
-    # failures from CLI discovery and capability preflight in the fresh run.
+    # Record every requested input before validation so invalid files also
+    # leave per-input logs and a NOT_CHECKED summary in the fresh run.
     try:
+        for kind, source in inputs:
+            if not source.is_file() or source.suffix != SUFFIXES[kind]:
+                raise ValueError(f"Expected an existing {SUFFIXES[kind]} file: {source}")
         cli = shutil.which(args.kicad_cli)
         if cli is None:
             raise ValueError(f"KiCad CLI not found: {args.kicad_cli}")
