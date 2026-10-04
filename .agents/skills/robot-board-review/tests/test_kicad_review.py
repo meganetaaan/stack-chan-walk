@@ -4,12 +4,14 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 SKILL = Path(__file__).resolve().parents[1]
+FIXTURES = SKILL / "tests/fixtures"
 SPEC = importlib.util.spec_from_file_location("kicad_review", SKILL / "scripts/kicad_review.py")
 assert SPEC is not None and SPEC.loader is not None
 review = importlib.util.module_from_spec(SPEC)
@@ -24,7 +26,7 @@ class ReviewTests(unittest.TestCase):
         self.sch = self.root / "root with spaces.kicad_sch"
         self.pcb = self.root / "controller.kicad_pcb"
         # These are mock inputs, deliberately not valid KiCad designs.
-        self.sch.write_text("mock schematic", encoding="utf-8")
+        self.sch.write_text("(kicad_sch)", encoding="utf-8")
         self.pcb.write_text("mock pcb", encoding="utf-8")
         self.out = self.root / "reports"
         self.calls = []
@@ -59,7 +61,10 @@ class ReviewTests(unittest.TestCase):
         if self.mutate:
             Path(command[-1]).write_text("changed", encoding="utf-8")
         if self.dependency_mutate_path is not None:
-            self.dependency_mutate_path.write_text("changed", encoding="utf-8")
+            changed = "(kicad_sch (text \"changed\"))" if (
+                self.dependency_mutate_path.suffix == ".kicad_sch"
+            ) else "changed"
+            self.dependency_mutate_path.write_text(changed, encoding="utf-8")
         code = 3 if command[1] == self.fail_kind else self.native_exit
         return subprocess.CompletedProcess(command, code, "mock stdout", "mock stderr")
 
@@ -195,12 +200,76 @@ class ReviewTests(unittest.TestCase):
         self.mutate = True
         self.assertEqual(self.invoke("--pcb", str(self.pcb)), 2)
 
+    def test_unrelated_symbol_sheetfile_does_not_prevent_erc(self):
+        shutil.copyfile(FIXTURES / "symbol-sheetfile.kicad_sch", self.sch)
+        self.assertEqual(self.invoke("--schematic", str(self.sch)), 0)
+        check = self.summaries()[0]["checks"][0]
+        self.assertEqual(check["status"], "PASS")
+        self.assertEqual(check["dependencies"], [str(self.sch)])
+        self.assertEqual(len([c for c in self.calls if "--output" in c]), 1)
+
+    def test_real_sheet_hierarchy_ignores_unrelated_and_quoted_properties(self):
+        hierarchy = self.root / "hierarchy"
+        shutil.copytree(FIXTURES / "hierarchy", hierarchy)
+        source = hierarchy / "root.kicad_sch"
+        self.assertEqual(self.invoke("--schematic", str(source)), 0)
+        expected = {
+            str(path.resolve()) for path in hierarchy.rglob("*.kicad_sch")
+        }
+        check = self.summaries()[0]["checks"][0]
+        self.assertEqual(set(check["dependencies"]), expected)
+        self.assertEqual(set(check["dependency_sha256"]), expected)
+        self.assertEqual(check["status"], "PASS")
+
+    def test_missing_real_child_is_not_checked(self):
+        self.sch.write_text(
+            '(kicad_sch (sheet (property "Sheetfile" "missing.kicad_sch")))',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.invoke("--schematic", str(self.sch)), 2)
+        check = self.summaries()[0]["checks"][0]
+        self.assertEqual(check["status"], "NOT_CHECKED")
+        self.assertIn("Referenced sheet does not exist", check["error"])
+        self.assertFalse(any("--output" in c for c in self.calls))
+
+    def test_invalid_real_child_extension_is_not_checked(self):
+        self.sch.write_text(
+            '(kicad_sch (sheet (property "Sheetfile" "not-a-schematic.txt")))',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.invoke("--schematic", str(self.sch)), 2)
+        self.assertIn("not a KiCad schematic", self.summaries()[0]["checks"][0]["error"])
+        self.assertFalse(any("--output" in c for c in self.calls))
+
+    def test_nested_child_change_is_not_success(self):
+        hierarchy = self.root / "hierarchy"
+        shutil.copytree(FIXTURES / "hierarchy", hierarchy)
+        self.dependency_mutate_path = hierarchy / "grandchild.kicad_sch"
+        self.assertEqual(self.invoke("--schematic", str(hierarchy / "root.kicad_sch")), 2)
+        check = self.summaries()[0]["checks"][0]
+        self.assertEqual(check["status"], "NOT_CHECKED")
+        self.assertIn("Review dependency changed", check["error"])
+
+    def test_shared_and_cyclic_dependencies_are_only_snapshotted_once(self):
+        hierarchy = self.root / "hierarchy"
+        shutil.copytree(FIXTURES / "hierarchy", hierarchy)
+        (hierarchy / "grandchild.kicad_sch").write_text(
+            '(kicad_sch (sheet (property "Sheetfile" "root.kicad_sch")))',
+            encoding="utf-8",
+        )
+        paths = review.dependency_paths((hierarchy / "root.kicad_sch").resolve())
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(len(set(paths)), 3)
+
     def test_hierarchical_and_rule_dependencies_are_snapshotted(self):
         child = self.root / "child.kicad_sch"
         project = self.sch.with_suffix(".kicad_pro")
         rules = self.sch.with_suffix(".kicad_dru")
-        self.sch.write_text('(property "Sheetfile" "child.kicad_sch")', encoding="utf-8")
-        child.write_text("child", encoding="utf-8")
+        self.sch.write_text(
+            '(kicad_sch (sheet (property "Sheetfile" "child.kicad_sch")))',
+            encoding="utf-8",
+        )
+        child.write_text("(kicad_sch)", encoding="utf-8")
         project.write_text("project", encoding="utf-8")
         rules.write_text("rules", encoding="utf-8")
 
@@ -214,8 +283,11 @@ class ReviewTests(unittest.TestCase):
         child = self.root / "child.kicad_sch"
         project = self.sch.with_suffix(".kicad_pro")
         rules = self.sch.with_suffix(".kicad_dru")
-        self.sch.write_text('(property "Sheetfile" "child.kicad_sch")', encoding="utf-8")
-        child.write_text("child", encoding="utf-8")
+        self.sch.write_text(
+            '(kicad_sch (sheet (property "Sheetfile" "child.kicad_sch")))',
+            encoding="utf-8",
+        )
+        child.write_text("(kicad_sch)", encoding="utf-8")
         project.write_text("project", encoding="utf-8")
         rules.write_text("rules", encoding="utf-8")
 
@@ -225,6 +297,48 @@ class ReviewTests(unittest.TestCase):
                 self.assertEqual(self.invoke("--schematic", str(self.sch)), 2)
                 check = self.summaries()[-1]["checks"][0]
                 self.assertIn("Review dependency", check["error"])
+
+
+class SheetfileParsingTests(unittest.TestCase):
+    def test_only_direct_properties_of_top_level_sheets_are_paths(self):
+        self.assertEqual(review.schematic_sheetfiles('''(kicad_sch
+          (property "Sheetfile" "root-field.kicad_sch")
+          (symbol (sheet (property "Sheetfile" "nested-sheet.kicad_sch")))
+          (sheet (pin "P" (property "Sheetfile" "pin-field.kicad_sch"))
+            (property "Sheetfile" "real.kicad_sch")))'''), ["real.kicad_sch"])
+
+    def test_quoted_paths_decode_escaped_quotes_and_backslashes_once(self):
+        self.assertEqual(review.schematic_sheetfiles(
+            r'(kicad_sch (sheet (property "Sheetfile" "folder\\child \"A\" (x).kicad_sch")))'
+        ), ['folder\\child "A" (x).kicad_sch'])
+        self.assertEqual(review.schematic_sheetfiles(
+            r'(kicad_sch (sheet (property "Sheetfile" "folder\\\"child.kicad_sch")))'
+        ), [r'folder\"child.kicad_sch'])
+
+    def test_quoted_parentheses_and_escaped_backslash_cannot_create_sheets(self):
+        self.assertEqual(review.schematic_sheetfiles(
+            r'''(kicad_sch
+              (text "(sheet (property \"Sheetfile\" \"fake.kicad_sch\"))")
+              (text "backslash at end \\")
+              (sheet (property "Sheetfile" "real.kicad_sch")))'''
+        ), ["real.kicad_sch"])
+
+    def test_malformed_expressions_are_not_silently_accepted(self):
+        for text in (
+            '', '(kicad_sch', '(kicad_sch))', '(kicad_sch (text "unterminated))',
+            '(kicad_sch) (kicad_sch)', 'atom (kicad_sch)', '(kicad_sch ())',
+            '(kicad_sch (sheet (property "Sheetfile")))',
+            '(kicad_sch (sheet (property "Sheetfile" unquoted)))',
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                review.schematic_sheetfiles(text)
+
+    def test_deep_nesting_does_not_require_python_recursion(self):
+        nested = '(effects ' * 1500 + '"(parentheses)"' + ')' * 1500
+        self.assertEqual(review.schematic_sheetfiles(
+            '(kicad_sch (sheet ' + nested
+            + '(property "Sheetfile" "real.kicad_sch")))'
+        ), ["real.kicad_sch"])
 
 
 if __name__ == "__main__":

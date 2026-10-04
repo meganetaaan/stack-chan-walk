@@ -1,0 +1,7 @@
+(kicad_sch
+  (version 20250114)
+  (generator "robot_board_review_test")
+  (sheet
+    (property "Sheetname" "Grandchild")
+    (property "Sheetfile" "../grandchild.kicad_sch"
+      (effects (font (size 1.27 1.27))))))

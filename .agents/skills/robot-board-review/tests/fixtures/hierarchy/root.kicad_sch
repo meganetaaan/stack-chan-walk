@@ -1,0 +1,19 @@
+(kicad_sch
+  (version 20250114)
+  (generator "robot_board_review_test")
+  (text "Escaped quote: \"; backslash: \\; fake (sheet (property \"Sheetfile\" \"text.kicad_sch\"))")
+  (lib_symbols
+    (symbol "Custom:Part"
+      (property "Sheetfile" "library-field.kicad_sch")))
+  (symbol
+    (property "Sheetfile" "symbol-field.kicad_sch"))
+  (sheet
+    (property "Sheetname" "Power (supply) \"A\"")
+    (pin "nested property"
+      (property "Sheetfile" "pin-field.kicad_sch"))
+    (property "Sheetfile" "nested/child (power).kicad_sch"
+      (at 10 20 0)
+      (effects (font (size 1.27 1.27)) (justify left top))))
+  (sheet
+    (property "Sheetname" "Shared instance")
+    (property "Sheetfile" "nested/child (power).kicad_sch")))

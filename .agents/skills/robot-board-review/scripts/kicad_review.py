@@ -19,9 +19,7 @@ from typing import Sequence
 
 COMMANDS = {"sch": "erc", "pcb": "drc"}
 SUFFIXES = {"sch": ".kicad_sch", "pcb": ".kicad_pcb"}
-SCHEMATIC_SHEETFILE = re.compile(
-    r'\(property\s+"Sheetfile"\s+"((?:\\.|[^"\\])*)"'
-)
+SEXPR_TOKEN = re.compile(r'\s+|"(?:\\.|[^"\\])*"|[()]|[^\s()"]+')
 DEPENDENCY_SIDECARS = (".kicad_pro", ".kicad_dru")
 MANUAL_REVIEW_REQUIRED = [
     "Project/rule settings loaded correctly, ignored rules and exclusions",
@@ -52,7 +50,54 @@ def command_for(cli: str, kind: str, source: Path, report: Path,
 
 def _decode_kicad_string(value: str) -> str:
     """Decode the escapes relevant to a KiCad quoted path."""
-    return value.replace(r"\\", "\\").replace(r'\"', '"')
+    return re.sub(r'\\(["\\])', r'\1', value)
+
+
+def schematic_sheetfiles(text: str) -> list[str]:
+    """Read only direct ``kicad_sch/sheet/property`` Sheetfile values.
+
+    Walk tokens iteratively, retaining just each node's first three atoms.
+    Quoted strings are single tokens, so their parentheses and escaped quotes
+    cannot introduce fake sheets or terminate a real one.
+    """
+    stack: list[list[str]] = []
+    paths: list[str] = []
+    root_closed = False
+    position = 0
+    while position < len(text):
+        match = SEXPR_TOKEN.match(text, position)
+        if match is None:
+            raise ValueError(f"Invalid schematic s-expression at offset {position}")
+        token = match.group()
+        position = match.end()
+        if token.isspace():
+            continue
+        if token == "(":
+            if root_closed:
+                raise ValueError("Multiple schematic s-expression roots")
+            stack.append([])
+        elif token == ")":
+            if not stack or not stack[-1]:
+                raise ValueError("Invalid schematic s-expression closing parenthesis")
+            node = stack.pop()
+            if (len(stack) == 2 and stack[0][:1] == ["kicad_sch"]
+                    and stack[1][:1] == ["sheet"]
+                    and node[:2] == ["property", '"Sheetfile"']):
+                if len(node) != 3 or not node[2].startswith('"'):
+                    raise ValueError("Sheetfile must have a quoted path")
+                paths.append(_decode_kicad_string(node[2][1:-1]))
+            if not stack:
+                if node[0] != "kicad_sch":
+                    raise ValueError("Expected a kicad_sch s-expression root")
+                root_closed = True
+        else:
+            if not stack:
+                raise ValueError("Schematic atom outside an s-expression")
+            if len(stack[-1]) < 3:
+                stack[-1].append(token)
+    if stack or not root_closed:
+        raise ValueError("Incomplete schematic s-expression")
+    return paths
 
 
 def dependency_paths(source: Path) -> list[Path]:
@@ -63,8 +108,8 @@ def dependency_paths(source: Path) -> list[Path]:
         while pending:
             schematic = pending.pop()
             text = schematic.read_text(encoding="utf-8")
-            for raw_path in SCHEMATIC_SHEETFILE.findall(text):
-                child = (schematic.parent / _decode_kicad_string(raw_path)).resolve()
+            for sheetfile in schematic_sheetfiles(text):
+                child = (schematic.parent / sheetfile).resolve()
                 if child.suffix != ".kicad_sch":
                     raise ValueError(f"Referenced sheet is not a KiCad schematic: {child}")
                 if not child.is_file():

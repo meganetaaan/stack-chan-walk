@@ -1,0 +1,7 @@
+(kicad_sch
+  (version 20250114)
+  (generator "robot_board_review_test")
+  (symbol
+    (property "Reference" "U1")
+    (property "Sheetfile" "not a schematic.txt"
+      (effects (font (size 1.27 1.27))))))
